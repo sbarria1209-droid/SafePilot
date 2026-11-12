@@ -10,7 +10,8 @@ MONTH=time.strftime('%Y-%m');REQUESTS={}
 def eq(a,b):return bool(a and b) and secrets.compare_digest(a.encode(),b.encode())
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='MODIXRelay/7'
+    server_version='MODIXRelay/8'
+    protocol_version='HTTP/1.1'
     def setup(self):super().setup();self.connection.settimeout(15)
     def log_message(self,*args):pass
     def send(self,status,data=b'',kind='application/json',compress=False,etag=None):
@@ -23,7 +24,10 @@ class Handler(BaseHTTPRequestHandler):
             if month!=MONTH:MONTH=month;OUTPUT_BYTES=0
             if OUTPUT_BYTES+len(data)>OUTPUT_LIMIT:status=429;data=b'{"error":"Limite de transferencia alcanzado"}';compressed=False
             OUTPUT_BYTES+=len(data)
-        self.send_response(status);self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','private, no-store');self.send_header('Referrer-Policy','no-referrer');self.send_header('X-Content-Type-Options','nosniff')
+        if status>=400:self.close_connection=True
+        self.send_response(status)
+        if self.close_connection:self.send_header('Connection','close')
+        self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','private, no-store');self.send_header('Referrer-Policy','no-referrer');self.send_header('X-Content-Type-Options','nosniff')
         if compressed:self.send_header('Content-Encoding','gzip')
         if etag:self.send_header('ETag',etag)
         self.end_headers()
@@ -44,23 +48,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         global VIEWED
         path=urlsplit(self.path).path
-        if path=='/health':self.send(200,{'service':'MODIX-HTTPS','protocol':7,'ready':len(OWNER)>=32});return
+        if path=='/health':self.send(200,{'service':'MODIX-HTTPS','protocol':7,'implementation':8,'ready':len(OWNER)>=32});return
         if path=='/':self.send(200,b'MODIX HTTPS - usa el cliente de escritorio.','text/plain; charset=utf-8');return
+        token=self.token();now=time.time()
+        # Sólo se toma una instantánea bajo el bloqueo. Ninguna respuesta de red,
+        # compresión ni descarga del modelo mantiene bloqueado el vídeo.
         with LOCK:
-            owner=eq(self.token(),OWNER);viewer=eq(self.token(),VIEWER)
-            if path=='/publish/status' and owner:self.send(200,{'viewing':time.time()-VIEWED<7,'active':bool(VIEWER),'session':SESSION});return
-            if not viewer:self.send(403,{'error':'Acceso cerrado o clave incorrecta'});return
-            if time.time()-UPDATED>15:
-                self.send(503,{'error':'La principal no está publicando datos recientes'});return
-            VIEWED=time.time()
-            if path=='/api/live':self.send(200,STATE or {},compress=True);return
-            if path=='/api/layers':
-                self.send(200,{'gcode':MODEL},compress=True);return
-            if path=='/camera.jpg':
-                if JPEG is None or time.time()-CAMERA_TIME>7:self.send(404,{'error':'Cámara USB sin imagen reciente'});return
-                etag='"'+hashlib.sha256(JPEG).hexdigest()[:24]+'"'
-                if self.headers.get('If-None-Match')==etag:self.send(304,b'',etag=etag);return
-                self.send(200,JPEG,'image/jpeg',etag=etag);return
+            owner=eq(token,OWNER);viewer=eq(token,VIEWER)
+            publisher_info={'viewing':now-VIEWED<7,'active':bool(VIEWER),'session':SESSION}
+            fresh=now-UPDATED<=15;state=STATE;model=MODEL;jpeg=JPEG;camera_time=CAMERA_TIME
+            if viewer and fresh:VIEWED=now
+        if path=='/publish/status' and owner:self.send(200,publisher_info);return
+        if not viewer:self.send(403,{'error':'Acceso cerrado o clave incorrecta'});return
+        if not fresh:self.send(503,{'error':'La principal no publica datos recientes'});return
+        if path=='/api/live':self.send(200,state or {},compress=True);return
+        if path=='/api/layers':self.send(200,{'gcode':model},compress=True);return
+        if path=='/camera.jpg':
+            if jpeg is None or now-camera_time>7:self.send(404,{'error':'Cámara USB sin imagen reciente'});return
+            etag='"'+hashlib.sha256(jpeg).hexdigest()[:24]+'"'
+            if self.headers.get('If-None-Match')==etag:self.send(304,b'',etag=etag);return
+            self.send(200,jpeg,'image/jpeg',etag=etag);return
         self.send(404,{'error':'Ruta no disponible'})
     def do_POST(self):
         global VIEWER,SESSION,UPDATED,STATE,MODEL,JPEG,CAMERA_TIME,REVISION
